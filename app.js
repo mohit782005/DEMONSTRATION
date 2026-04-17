@@ -1,9 +1,9 @@
 // ─── app.js ──────────────────────────────────────────────────
 // Express server wiring all 15 functions together.
+// Streams ALL logs to Nexus-X via WebSocket (like nexus attach).
 
 const express = require("express");
-const http = require("http");
-const https = require("https");
+const WebSocket = require("ws");
 const { registerUser, loginUser } = require("./auth");
 const { createOrder, getOrdersByUser, getOrderSummary } = require("./orders");
 
@@ -12,6 +12,81 @@ const NEXUS_PROJECT = process.env.NEXUS_PROJECT || "mohit-s-workspace/DEMONSTRAT
 
 const app = express();
 app.use(express.json());
+
+// ═══════════════════════════════════════════════════════════════
+// Nexus-X WebSocket Telemetry — streams every log to dashboard
+// ═══════════════════════════════════════════════════════════════
+
+let nexusWs = null;
+
+function connectToNexus() {
+  if (!NEXUS_API_URL) return;
+
+  const parts = NEXUS_PROJECT.split("/");
+  const wsBase = NEXUS_API_URL.replace("https://", "wss://").replace("http://", "ws://");
+  const wsUrl = `${wsBase}/ws/runner/${parts[0]}/${parts[1]}`;
+
+  console.log(`[Nexus-X] Connecting WebSocket → ${wsUrl}`);
+
+  nexusWs = new WebSocket(wsUrl);
+
+  nexusWs.on("open", () => {
+    console.log("[Nexus-X] ✅ WebSocket connected — streaming logs to dashboard");
+    // Send initial handshake
+    nexusWs.send(JSON.stringify({
+      type: "init",
+      command: "node app.js",
+      cwd: process.cwd(),
+      timestamp: Date.now(),
+    }));
+  });
+
+  nexusWs.on("close", () => {
+    console.log("[Nexus-X] WebSocket disconnected — reconnecting in 5s...");
+    setTimeout(connectToNexus, 5000);
+  });
+
+  nexusWs.on("error", (err) => {
+    console.error(`[Nexus-X] WebSocket error: ${err.message}`);
+  });
+}
+
+function sendLog(line, stream = "stdout") {
+  if (nexusWs && nexusWs.readyState === WebSocket.OPEN) {
+    nexusWs.send(JSON.stringify({
+      type: "log",
+      line: line,
+      stream: stream,
+      ts: Date.now(),
+    }));
+  }
+}
+
+function sendExit(code) {
+  if (nexusWs && nexusWs.readyState === WebSocket.OPEN) {
+    nexusWs.send(JSON.stringify({
+      type: "exit",
+      code: code,
+      ts: Date.now(),
+    }));
+  }
+}
+
+// ── Intercept console.log & console.error ──
+const _origLog = console.log;
+const _origErr = console.error;
+
+console.log = function (...args) {
+  const line = args.map(String).join(" ");
+  _origLog.apply(console, args);
+  sendLog(line, "stdout");
+};
+
+console.error = function (...args) {
+  const line = args.map(String).join(" ");
+  _origErr.apply(console, args);
+  sendLog(line, "stderr");
+};
 
 // ─── Auth Routes ─────────────────────────────────────────────
 
@@ -66,59 +141,27 @@ app.get("/health", (req, res) => {
 // ─── Trigger a crash (for demo) ──────────────────────────────
 
 app.get("/crash", (req, res) => {
+  console.error("🚨 CRASH TRIGGERED BY USER — simulating fatal error...");
   res.json({ message: "Crashing in 1 second..." });
   setTimeout(() => {
     throw new Error("FATAL: Unhandled payment gateway timeout in processCheckout()");
   }, 1000);
 });
 
-// ─── Nexus-X Crash Reporter ─────────────────────────────────
-
-function reportToNexus(errorMessage, stack) {
-  if (!NEXUS_API_URL) return;
-  const parts = NEXUS_PROJECT.split("/");
-  const workspace = parts[0];
-  const project = parts[1];
-  const url = `${NEXUS_API_URL}/api/repo/${workspace}/${project}/logs`;
-
-  const payload = JSON.stringify({
-    logs: [
-      { line: `[Render] CRASH: ${errorMessage}`, stream: "stderr", ts: Date.now() },
-      { line: `[Render] Stack: ${(stack || "").split("\n").slice(0, 5).join(" | ")}`, stream: "stderr", ts: Date.now() },
-    ],
-    exit_code: 1,
-  });
-
-  const client = url.startsWith("https") ? https : http;
-  const parsed = new URL(url);
-  const opts = {
-    hostname: parsed.hostname,
-    port: parsed.port,
-    path: parsed.pathname,
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
-  };
-
-  const req = client.request(opts, (res) => {
-    console.log(`[Nexus-X] Crash reported → ${res.statusCode}`);
-  });
-  req.on("error", (e) => console.error(`[Nexus-X] Report failed: ${e.message}`));
-  req.write(payload);
-  req.end();
-}
+// ─── Error Handlers ──────────────────────────────────────────
 
 // Global Express error handler
 app.use((err, req, res, next) => {
-  console.error("[Express Error]", err.message);
-  reportToNexus(err.message, err.stack);
+  console.error(`[Express Error] ${err.message}`);
   res.status(500).json({ ok: false, error: err.message });
 });
 
-// Catch uncaught exceptions
+// Catch uncaught exceptions — report to Nexus then exit
 process.on("uncaughtException", (err) => {
-  console.error("[FATAL]", err.message);
-  reportToNexus(err.message, err.stack);
-  setTimeout(() => process.exit(1), 2000); // give time for the HTTP request
+  console.error(`[FATAL] ${err.message}`);
+  console.error(err.stack);
+  sendExit(1);
+  setTimeout(() => process.exit(1), 2000);
 });
 
 // ─── Start ───────────────────────────────────────────────────
@@ -126,9 +169,8 @@ process.on("uncaughtException", (err) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 Sample Express API running on port ${PORT}`);
-  if (NEXUS_API_URL) {
-    console.log(`📡 Nexus-X telemetry → ${NEXUS_API_URL} (${NEXUS_PROJECT})`);
-  }
+  // Connect to Nexus-X via WebSocket after server starts
+  connectToNexus();
 });
 
 module.exports = app;
